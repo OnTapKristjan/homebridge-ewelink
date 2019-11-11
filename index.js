@@ -100,11 +100,10 @@ eWeLink.prototype.addAccessory = function(connection, device, deviceId, services
             newAccessory.context.switches = result.switchesAmount;
             for (let channel=1; channel < result.switchesAmount + 1; channel++) {
                 let service = new Service.Switch(device.name, 'c' + channel);
-                service
-                    .getCharacteristic(Characteristic.On)
+                service.getCharacteristic(Characteristic.On)
                     .on('set', function(value, callback) {
                         (async () => {
-                            await connection.toggleDevice(deviceId, channel);
+                            await connection.setDevicePowerState(deviceId, value ? 'on' : 'off', channel);
                             callback();
                         })();
                     })
