@@ -19,31 +19,28 @@ module.exports = function(homebridge) {
 
 function eWeLink(log, config, api) {
     let platform = this;
-
     this.log = log;
     this.config = config;
     this.accessories = new Map();
     this.api = api;
+    this.connection = new ewelink({
+        email: this.config['email'],
+        password: this.config['password'],
+    });
 
     this.api.on('didFinishLaunching', this.registerDevices.bind(this));
 }
 
 eWeLink.prototype.registerDevices = function () {
     (async () => {
-        const connection = new ewelink({
-            email: this.config['email'],
-            password: this.config['password'],
-        });
+        const devices = await this.connection.getDevices();
 
-        /* get all devices */
-        const devices = await connection.getDevices();
-
-        this.log('There are a total of [%s] devices registered', devices.length);
+        this.log('Found total of [%s] devices registered with eWeLink', devices.length);
 
         devices.forEach((device) => {
             this.log('[%s] registering %s %s', device.deviceid, device.brandName, device.productModel);
             let services = this.getDeviceServices(device);
-            this.addAccessory(connection, device, device.deviceid, services);
+            this.addAccessory(device, device.deviceid, services);
         });
     })();
 };
@@ -55,33 +52,65 @@ eWeLink.prototype.getDeviceServices = function (device) {
     return services;
 };
 
+/**
+ * @param {Accessory} accessory
+ */
 eWeLink.prototype.configureAccessory = function(accessory) {
     this.log(accessory.displayName, "Configure Accessory");
-    var platform = this;
 
-    // Set the accessory to reachable if plugin can currently process the accessory,
-    // otherwise set to false and update the reachability later by invoking
-    // accessory.updateReachability()
-    accessory.reachable = true;
+    (async () => {
+        let device = this.connection.getDevice(accessory.context.deviceId);
+        this.log('Device online: %s', device.online);
+        accessory.updateReachability(device.online === 'true');
+    })();
 
-    accessory.on('identify', function(paired, callback) {
-        platform.log(accessory.displayName, "Identify!!!");
-        callback();
-    });
-
-    if (accessory.getService(Service.Lightbulb)) {
-        accessory.getService(Service.Lightbulb)
-            .getCharacteristic(Characteristic.On)
-            .on('set', function(value, callback) {
-                platform.log(accessory.displayName, "Light -> " + value);
-                callback();
-            });
+    for (let idx in accessory.services) {
+        let service = accessory.services[idx];
+        if (service.subtype === undefined) {
+            continue;
+        }
+        let channel = service.subtype.substr(1);
+        service.getCharacteristic(Characteristic.On)
+            .on('set', this.setPowerState.bind(this, accessory, channel))
+            .on('get', this.getPowerState.bind(this, accessory, channel));
     }
 
     this.accessories.set(accessory.context.deviceId, accessory);
 };
 
-eWeLink.prototype.addAccessory = function(connection, device, deviceId, services) {
+eWeLink.prototype.setPowerState = function(accessory, channel, value, callback) {
+    (async () => {
+        let deviceId = accessory.context.deviceId;
+        const status = await this.connection.setDevicePowerState(deviceId, value ? 'on' : 'off', channel);
+        this.log('[%s][channel %s] set power state = %o', accessory.displayName, channel, status);
+        callback();
+    })();
+};
+
+/**
+ * @param {Accessory} accessory
+ * @param {int} channel
+ * @param {Function} callback
+ */
+eWeLink.prototype.getPowerState = function(accessory, channel, callback) {
+    (async () => {
+        let deviceId = accessory.context.deviceId;
+        const status = await this.connection.getDevicePowerState(deviceId, channel);
+        this.log('[%s][channel %s] get power state = %o', accessory.displayName, channel, status);
+        if (status.state === 'on') {
+            callback(null, 1);
+        } else {
+            callback(null, 0);
+        }
+    })();
+};
+
+eWeLink.prototype.addAccessory = function(device, deviceId, services) {
+    if (this.accessories.get(deviceId)) {
+        this.log("[%s] is already registered", deviceId);
+        return;
+    }
+
     this.log("Add Accessory [%s]", device.name);
     let platform = this;
     let uuid;
@@ -94,35 +123,33 @@ eWeLink.prototype.addAccessory = function(connection, device, deviceId, services
     // newAccessory.context.channel = 0;
     newAccessory.reachable = device.online === 'true';
 
-    if (services.switch) {
-        (async () => {
-            const result = await connection.getDeviceChannelCount(deviceId);
-            newAccessory.context.switches = result.switchesAmount;
-            for (let channel=1; channel < result.switchesAmount + 1; channel++) {
-                let service = new Service.Switch(device.name, 'c' + channel);
-                service.getCharacteristic(Characteristic.On)
-                    .on('set', function(value, callback) {
-                        (async () => {
-                            await connection.setDevicePowerState(deviceId, value ? 'on' : 'off', channel);
-                            callback();
-                        })();
-                    })
-                    .on('get', function(callback) {
-                        (async () => {
-                            const status = await connection.getDevicePowerState(deviceId, channel);
-                            if (status.state === 'on') {
-                                callback(null, 1);
-                            } else {
-                                callback(null, 0);
-                            }
-                        })();
-                    });
+    (async () => {
+        const result = await this.connection.getDeviceChannelCount(deviceId);
+        newAccessory.context.switches = result.switchesAmount;
+        for (let channel=1; channel < result.switchesAmount + 1; channel++) {
+            let service = new Service.Switch(device.name, 'c' + channel);
+            service.getCharacteristic(Characteristic.On)
+                .on('set', function(value, callback) {
+                    (async () => {
+                        await this.connection.setDevicePowerState(deviceId, value ? 'on' : 'off', channel);
+                        callback();
+                    })();
+                }.bind(this))
+                .on('get', function(callback) {
+                    (async () => {
+                        const status = await this.connection.getDevicePowerState(deviceId, channel);
+                        if (status.state === 'on') {
+                            callback(null, 1);
+                        } else {
+                            callback(null, 0);
+                        }
+                    })();
+                }.bind(this));
 
-                platform.log('Adding service Service.Switch for [%s], channel [%s]', service.displayName, channel);
-                newAccessory.addService(service);
-            }
-        })();
-    }
+            platform.log('Adding service Service.Switch for [%s], channel [%s]', service.displayName, channel);
+            newAccessory.addService(service);
+        }
+    })();
 
     newAccessory.on('identify', function(paired, callback) {
         platform.log(newAccessory.displayName, "Identify not supported");
